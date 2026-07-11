@@ -1,7 +1,7 @@
 [project]
 name = "data-porter"
-version = "0.1.0"
-description = "Manifest-driven personal data migration tool (core scan engine, v0.1)"
+version = "0.1.1"
+description = "Manifest-driven, resumable personal data migration tool for Windows 10/11"
 requires-python = ">=3.11"
 dependencies = []
 

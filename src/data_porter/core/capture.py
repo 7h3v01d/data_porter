@@ -1,19 +1,4 @@
-"""
-Capture: copies the files described by a migration manifest into the
-package, safely.
-
-Rules from the spec baked in here:
-  * files are written under a ``.dataporter-partial`` staged name and only
-    renamed to their real name after the copy (and any hashing) succeeds --
-    an interrupted capture can never leave a half-written file looking valid;
-  * every completed file is journaled to ``package_state.sqlite``
-    immediately, so re-running capture on the same package_dir resumes
-    (only pending/failed rows are (re)attempted) instead of starting over;
-  * a failure on one file is recorded and capture moves on -- it does not
-    abort the whole run;
-  * hashing has three levels (fast / balanced / full) trading thoroughness
-    for time, matching the spec's verification-effort options.
-"""
+"""Resumable, staged capture of selected personal files into a package."""
 
 from __future__ import annotations
 
@@ -28,15 +13,17 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .manifest import MigrationManifest
-from .models import SkipReason
+from .package import init_package_db
+from .safety import safe_join, validate_package_location, validate_source_roots
 from .scanner import walk_tree_entries
 
 STAGING_SUFFIX = ".dataporter-partial"
+BALANCED_FULL_HASH_MAX_BYTES = 200 * 1024 * 1024
+PARTIAL_HASH_SAMPLE_BYTES = 1 * 1024 * 1024
 
-# Above this size, "balanced" mode uses a cheap partial hash instead of a
-# full SHA-256, so a handful of huge video files don't dominate capture time.
-BALANCED_FULL_HASH_MAX_BYTES = 200 * 1024 * 1024  # 200 MB
-PARTIAL_HASH_SAMPLE_BYTES = 1 * 1024 * 1024  # 1 MB from each end
+HASH_NONE = "none"
+HASH_SHA256_FULL = "sha256_full"
+HASH_SHA256_SAMPLED_V1 = "sha256_sampled_v1"
 
 
 def _now() -> str:
@@ -45,8 +32,6 @@ def _now() -> str:
 
 def _relpath_for_item(source_root: str, file_path: str) -> str:
     rel = os.path.relpath(file_path, source_root)
-    # Keep forward slashes in stored/relative form for portability, even
-    # though the actual filesystem copy uses OS-native os.path.join.
     return rel.replace(os.sep, "/")
 
 
@@ -64,18 +49,72 @@ class CaptureSummary:
         return dataclasses.asdict(self)
 
 
+def _hash_file_full(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _hash_file_partial(path: str, size: int) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        h.update(handle.read(PARTIAL_HASH_SAMPLE_BYTES))
+        if size > PARTIAL_HASH_SAMPLE_BYTES:
+            handle.seek(max(size - PARTIAL_HASH_SAMPLE_BYTES, 0))
+            h.update(handle.read(PARTIAL_HASH_SAMPLE_BYTES))
+    h.update(str(size).encode("ascii"))
+    return "partial:" + h.hexdigest()
+
+
+def _hash_kind_for_level(hash_level: str, size: int) -> str:
+    if hash_level == "fast":
+        return HASH_NONE
+    if hash_level == "full" or size <= BALANCED_FULL_HASH_MAX_BYTES:
+        return HASH_SHA256_FULL
+    return HASH_SHA256_SAMPLED_V1
+
+
+def _infer_hash_kind(stored_hash: Optional[str], recorded_kind: Optional[str] = None) -> str:
+    if recorded_kind in (HASH_NONE, HASH_SHA256_FULL, HASH_SHA256_SAMPLED_V1):
+        if recorded_kind != HASH_NONE or stored_hash is None:
+            return recorded_kind
+    if stored_hash is None:
+        return HASH_NONE
+    if str(stored_hash).startswith("partial:"):
+        return HASH_SHA256_SAMPLED_V1
+    return HASH_SHA256_FULL
+
+
+def _compute_hash_for_kind(path: str, size: int, hash_kind: str) -> Optional[str]:
+    if hash_kind == HASH_NONE:
+        return None
+    if hash_kind == HASH_SHA256_FULL:
+        return _hash_file_full(path)
+    if hash_kind == HASH_SHA256_SAMPLED_V1:
+        return _hash_file_partial(path, size)
+    raise ValueError(f"unsupported hash kind: {hash_kind!r}")
+
+
+def _compute_hash(path: str, size: int, hash_level: str) -> Optional[str]:
+    """Backward-compatible helper used by restore/verify callers."""
+    return _compute_hash_for_kind(path, size, _hash_kind_for_level(hash_level, size))
+
+
 def seed_package_files(package_dir: str, manifest: MigrationManifest) -> int:
-    """
-    Walk each item's source tree and insert a row per file into
-    package_state.sqlite (INSERT OR IGNORE, so re-seeding is safe and
-    additive). Also appends anything the walk had to skip to
-    metadata/skipped_files.jsonl. Returns the number of newly seeded rows.
-    """
+    """Seed new files and requeue files whose source metadata has changed."""
+    validate_source_roots(item.source_path for item in manifest.items)
+    validate_package_location(package_dir, (item.source_path for item in manifest.items))
+
     db_path = os.path.join(package_dir, "package_state.sqlite")
+    init_package_db(db_path)
     skipped_path = os.path.join(package_dir, "metadata", "skipped_files.jsonl")
+    os.makedirs(os.path.dirname(skipped_path), exist_ok=True)
 
     conn = sqlite3.connect(db_path)
-    seeded = 0
+    conn.row_factory = sqlite3.Row
+    seeded_or_requeued = 0
     try:
         with open(skipped_path, "a", encoding="utf-8") as skip_log:
             for item in manifest.items:
@@ -90,64 +129,93 @@ def seed_package_files(package_dir: str, manifest: MigrationManifest) -> int:
 
                     rel = _relpath_for_item(item.source_path, entry.path)
                     package_rel_path = f"{item.package_path}/{rel}"
-                    cur = conn.execute(
-                        """
-                        INSERT OR IGNORE INTO files
-                        (item_logical_folder, source_path, package_rel_path,
-                         size_bytes, modified_utc, is_cloud_placeholder, status, updated_utc)
-                        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-                        """,
+                    # Validate before anything from the manifest reaches join().
+                    safe_join(package_dir, package_rel_path)
+                    try:
+                        mtime_ns = os.stat(entry.path, follow_symlinks=False).st_mtime_ns
+                    except OSError:
+                        mtime_ns = None
+
+                    existing = conn.execute(
+                        "SELECT * FROM files WHERE source_path = ?", (entry.path,)
+                    ).fetchone()
+                    if existing is None:
+                        conn.execute(
+                            """
+                            INSERT INTO files
+                            (item_logical_folder, source_path, package_rel_path,
+                             size_bytes, modified_utc, source_mtime_ns,
+                             is_cloud_placeholder, status, hash_kind, updated_utc)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'none', ?)
+                            """,
+                            (
+                                item.logical_folder,
+                                entry.path,
+                                package_rel_path,
+                                entry.size_bytes,
+                                entry.modified_utc,
+                                mtime_ns,
+                                1 if entry.is_cloud_placeholder else 0,
+                                _now(),
+                            ),
+                        )
+                        seeded_or_requeued += 1
+                        continue
+
+                    changed = any(
                         (
-                            item.logical_folder,
-                            entry.path,
-                            package_rel_path,
-                            entry.size_bytes,
-                            entry.modified_utc,
-                            1 if entry.is_cloud_placeholder else 0,
-                            _now(),
-                        ),
+                            existing["item_logical_folder"] != item.logical_folder,
+                            existing["package_rel_path"] != package_rel_path,
+                            existing["size_bytes"] != entry.size_bytes,
+                            existing["source_mtime_ns"] != mtime_ns,
+                        )
                     )
-                    seeded += cur.rowcount
+                    if changed:
+                        old_rel = existing["package_rel_path"]
+                        conn.execute(
+                            """
+                            UPDATE files
+                            SET item_logical_folder=?, package_rel_path=?, size_bytes=?,
+                                modified_utc=?, source_mtime_ns=?, is_cloud_placeholder=?,
+                                status='pending', sha256=NULL, hash_kind='none', error=NULL,
+                                updated_utc=?
+                            WHERE id=?
+                            """,
+                            (
+                                item.logical_folder,
+                                package_rel_path,
+                                entry.size_bytes,
+                                entry.modified_utc,
+                                mtime_ns,
+                                1 if entry.is_cloud_placeholder else 0,
+                                _now(),
+                                existing["id"],
+                            ),
+                        )
+                        # If this package has already been restored somewhere,
+                        # a newly recaptured source must be eligible for restore
+                        # again rather than remaining falsely "restored".
+                        has_restore_state = conn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='restore_state'"
+                        ).fetchone()
+                        if has_restore_state:
+                            conn.execute(
+                                "UPDATE restore_state SET status='pending', dest_path=NULL, "
+                                "conflict=NULL, error=NULL, updated_utc=? WHERE file_id=?",
+                                (_now(), existing["id"]),
+                            )
+                        if old_rel != package_rel_path:
+                            try:
+                                old_path = safe_join(package_dir, old_rel)
+                                if os.path.isfile(old_path):
+                                    os.remove(old_path)
+                            except (OSError, ValueError):
+                                pass
+                        seeded_or_requeued += 1
         conn.commit()
     finally:
         conn.close()
-    return seeded
-
-
-def _hash_file_full(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _hash_file_partial(path: str, size: int) -> str:
-    """Cheap integrity signal for very large files: hash the first and
-    last PARTIAL_HASH_SAMPLE_BYTES plus the size. Not a substitute for a
-    full hash -- stored with a "partial:" prefix so it's never confused
-    with one."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        head = f.read(PARTIAL_HASH_SAMPLE_BYTES)
-        h.update(head)
-        if size > PARTIAL_HASH_SAMPLE_BYTES:
-            f.seek(max(size - PARTIAL_HASH_SAMPLE_BYTES, 0))
-            tail = f.read(PARTIAL_HASH_SAMPLE_BYTES)
-            h.update(tail)
-    h.update(str(size).encode())
-    return "partial:" + h.hexdigest()
-
-
-def _compute_hash(path: str, size: int, hash_level: str) -> Optional[str]:
-    if hash_level == "fast":
-        return None
-    if hash_level == "full":
-        return _hash_file_full(path)
-    # balanced
-    if size <= BALANCED_FULL_HASH_MAX_BYTES:
-        return _hash_file_full(path)
-    return _hash_file_partial(path, size)
+    return seeded_or_requeued
 
 
 def run_capture(
@@ -156,18 +224,18 @@ def run_capture(
     hash_level: str = "balanced",
     reseed: bool = True,
 ) -> CaptureSummary:
-    """
-    Copy every pending/failed file from its source location into the
-    package, staging each write and journaling progress so this can be
-    safely re-run (pause/resume/retry) against the same package_dir.
-    """
-    assert hash_level in ("fast", "balanced", "full")
+    if hash_level not in ("fast", "balanced", "full"):
+        raise ValueError("hash_level must be fast, balanced, or full")
+
+    validate_source_roots(item.source_path for item in manifest.items)
+    validate_package_location(package_dir, (item.source_path for item in manifest.items))
 
     summary = CaptureSummary()
     if reseed:
         summary.seeded = seed_package_files(package_dir, manifest)
 
     db_path = os.path.join(package_dir, "package_state.sqlite")
+    init_package_db(db_path)
     checksums_path = os.path.join(package_dir, "checksums.jsonl")
     errors_path = os.path.join(package_dir, "metadata", "errors.jsonl")
 
@@ -184,7 +252,17 @@ def run_capture(
             for row in rows:
                 source_path = row["source_path"]
                 package_rel_path = row["package_rel_path"]
-                dest_path = os.path.join(package_dir, package_rel_path)
+                try:
+                    dest_path = safe_join(package_dir, package_rel_path)
+                except ValueError as exc:
+                    conn.execute(
+                        "UPDATE files SET status='failed', error=?, updated_utc=? WHERE id=?",
+                        (str(exc), _now(), row["id"]),
+                    )
+                    conn.commit()
+                    summary.failed += 1
+                    summary.errors.append({"source_path": source_path, "error": str(exc)})
+                    continue
                 staged_path = dest_path + STAGING_SUFFIX
 
                 conn.execute(
@@ -194,30 +272,44 @@ def run_capture(
                 conn.commit()
 
                 try:
+                    before = os.stat(source_path, follow_symlinks=False)
                     if not os.path.isfile(source_path):
-                        raise FileNotFoundError(
-                            f"source file no longer present: {source_path}"
-                        )
+                        raise FileNotFoundError(f"source file no longer present: {source_path}")
 
                     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    if os.path.exists(staged_path):
+                        os.remove(staged_path)
                     shutil.copy2(source_path, staged_path)
+                    after = os.stat(source_path, follow_symlinks=False)
+
+                    if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+                        raise IOError("source file changed during capture; it will be retried")
 
                     staged_size = os.path.getsize(staged_path)
-                    source_size = os.path.getsize(source_path)
-                    if staged_size != source_size:
+                    if staged_size != after.st_size:
                         raise IOError(
-                            f"size mismatch after copy: source={source_size} staged={staged_size} "
-                            "(source may have changed during capture)"
+                            f"size mismatch after copy: source={after.st_size} staged={staged_size}"
                         )
 
-                    file_hash = _compute_hash(staged_path, staged_size, hash_level)
-
+                    hash_kind = _hash_kind_for_level(hash_level, staged_size)
+                    file_hash = _compute_hash_for_kind(staged_path, staged_size, hash_kind)
                     os.replace(staged_path, dest_path)
 
                     conn.execute(
-                        "UPDATE files SET status='copied', sha256=?, size_bytes=?, error=NULL, "
-                        "updated_utc=? WHERE id=?",
-                        (file_hash, staged_size, _now(), row["id"]),
+                        """
+                        UPDATE files
+                        SET status='copied', sha256=?, hash_kind=?, size_bytes=?,
+                            source_mtime_ns=?, error=NULL, updated_utc=?
+                        WHERE id=?
+                        """,
+                        (
+                            file_hash,
+                            hash_kind,
+                            staged_size,
+                            after.st_mtime_ns,
+                            _now(),
+                            row["id"],
+                        ),
                     )
                     conn.commit()
 
@@ -228,12 +320,13 @@ def run_capture(
                                 "package_rel_path": package_rel_path,
                                 "size_bytes": staged_size,
                                 "sha256": file_hash,
+                                "hash_kind": hash_kind,
                                 "captured_utc": _now(),
                             }
                         )
                         + "\n"
                     )
-
+                    checksum_log.flush()
                     summary.copied += 1
                     summary.total_bytes_copied += staged_size
 
@@ -254,13 +347,14 @@ def run_capture(
                         )
                         + "\n"
                     )
+                    error_log.flush()
                     summary.failed += 1
                     summary.errors.append({"source_path": source_path, "error": str(exc)})
 
-        already_done = conn.execute(
-            "SELECT COUNT(*) FROM files WHERE status = 'copied'"
+        done = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE status IN ('copied', 'verified')"
         ).fetchone()[0]
-        summary.already_done = already_done - summary.copied
+        summary.already_done = max(0, done - summary.copied)
     finally:
         conn.close()
 
@@ -268,8 +362,8 @@ def run_capture(
 
 
 def capture_status(package_dir: str) -> dict:
-    """Quick status summary of a package's file table, for progress UIs."""
     db_path = os.path.join(package_dir, "package_state.sqlite")
+    init_package_db(db_path)
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(

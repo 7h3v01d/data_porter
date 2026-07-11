@@ -1,4 +1,34 @@
-# Data Porter — v0.1 (scan → plan → capture → verify → restore)
+# Data Porter — v0.1.1 Integrity Hardening
+
+
+## Dad-ready guided mode
+
+For the current Windows-to-Windows move, the simplest path is:
+
+1. Copy this whole project folder to the PC or an external drive.
+2. Double-click **`RUN_DATA_PORTER.bat`**.
+3. On the old PC choose **Capture data from the OLD PC**.
+4. On the new PC choose **Restore data onto the NEW PC**.
+5. Follow **`DAD_MOVE_CHECKLIST.md`** and do not erase the old PC until the final restore verification and a manual check both pass.
+
+The guided launcher is deliberately plain. It performs a scan, shows the selected data, checks destination free space and FAT32 limits, creates or safely resumes a package, verifies it, previews restore destinations, blocks unresolved custom folders, applies an explicit conflict policy, and verifies the restored files. It requires Python 3.11 or newer; no GUI framework is required.
+
+## v0.1.1 safety hardening
+
+This pass closes the highest-risk failure paths found during review:
+
+- blocks creating or moving a migration package inside a selected source folder;
+- rejects duplicate and parent/child source selections;
+- treats package manifests and SQLite paths as untrusted and blocks path traversal;
+- records the hash algorithm explicitly so sampled and full hashes are never compared incorrectly;
+- detects changed source files and requeues them for capture;
+- detects files that change while being copied;
+- recovers interrupted `restoring` state safely;
+- prevents restore destinations from overlapping the package;
+- refuses to overwrite an existing package with a different migration plan;
+- requeues missing or corrupted restored files for repair;
+- records directory-walk errors instead of silently ignoring them;
+- returns a partial-failure exit code when restore destinations remain unresolved.
 
 All six pipeline stages from the v0.1 MVP boundary are now implemented:
 **discovery, packaging, capture, verification, restore, and post-restore
@@ -22,15 +52,14 @@ scan  →  plan  →  capture  →  verify  →  restore  →  restore-verify
 
 - **`core/known_folders.py`** — resolves Known Folders (Documents, Pictures,
   Downloads, Music, Videos, Desktop, Saved Games, Favorites, Contacts) via
-  the real Windows Known Folder API (`SHGetKnownFolderPath`), with two
-  fallback tiers:
+  the real Windows Known Folder API (`SHGetKnownFolderPath`), with three
+  resolution tiers:
   1. `pywin32` (primary, used when installed)
   2. raw `ctypes` call into `shell32.dll` (works even without pywin32)
-  3. a **dev fallback** (home-directory guess) that only activates on
-     non-Windows platforms — this is what let me build and test the whole
-     thing in this sandbox without a Windows box on hand. It's clearly
-     tagged in the result (`method="dev_fallback"`) so it can never be
-     mistaken for a real Windows resolution once you run it on your PC.
+  3. a **dev fallback** (home-directory guess) that activates only on
+     non-Windows development/test platforms. On a real Windows machine, if
+     both Windows API methods fail, Data Porter stops with an unresolved
+     destination instead of guessing.
 
 - **`core/scanner.py`** — the actual walk. Per the spec's edge-case list,
   it already handles:
@@ -158,7 +187,7 @@ scan  →  plan  →  capture  →  verify  →  restore  →  restore-verify
 
 ## Running it
 
-On Windows machine (once you copy this over):
+On your dad's Windows machine (once you copy this over):
 
 ```bash
 pip install pywin32          # optional, primary resolution path
@@ -180,7 +209,8 @@ without Windows at all.
 python -m unittest discover -s tests -v
 ```
 
-25 tests currently:
+32 tests currently:
+- `test_hardening.py` (7): package/source overlap blocking, existing-package overwrite protection, modified-source recapture, sampled/full hash interoperability, interrupted-restore recovery, restore path-traversal blocking, and verified repair of corrupted restored files.
 - `test_scanner.py` (5): basic count/size, missing-folder handling, top-N
   ordering, symlink/reparse-point pruning, empty folders.
 - `test_pipeline.py` (8): manifest helpers (name sanitizing/dedup), a full
@@ -237,6 +267,6 @@ restore-verify) working end to end, the natural next steps are either:
    `is_cloud_placeholder`, so the groundwork is there, but there's no
    explicit hydrate/exclude policy wired through capture yet.
 
-Given the move is Win11→Win11 with likely OneDrive-redirected folders,
+Given Dad's move is Win11→Win11 with likely OneDrive-redirected folders,
 I'd lean toward OneDrive-awareness before the GUI — it's the part of the
 spec most likely to bite on his actual machine.

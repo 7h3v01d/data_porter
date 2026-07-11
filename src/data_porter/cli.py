@@ -29,6 +29,7 @@ from .core.restore import (
     verify_restore,
 )
 from .core.verify import verify_package
+from .core.safety import SafetyError
 
 
 def _load_scan_report(json_path: str) -> ScanReport:
@@ -70,7 +71,7 @@ def _human_size(num_bytes: int) -> str:
     return f"{size:.1f} TB"
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="data-porter", description="Data Porter scan engine")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -294,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
         if preview.unresolved_items:
             print()
             print(f"UNRESOLVED (won't be restored until resolved): {', '.join(preview.unresolved_items)}")
-        return 0
+        return 0 if not preview.unresolved_items else 2
 
     if args.command == "restore":
         manifest = load_manifest(args.package_dir)
@@ -334,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
             print()
             print(f"Report written to: {args.report}")
 
-        return 0 if summary.failed == 0 else 2
+        return 0 if summary.failed == 0 and not summary.blocked_items else 2
 
     if args.command == "restore-status":
         status = restore_status(args.package_dir)
@@ -359,6 +360,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if summary.failed == 0 and summary.missing == 0 else 2
 
     return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except SafetyError as exc:
+        print(f"SAFE STOP: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\nCancelled safely. Re-run the same command to resume.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

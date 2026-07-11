@@ -113,7 +113,22 @@ def walk_tree_entries(source_path: str):
     Reparse-point pruning happens once here so scanning and capturing can
     never disagree about which files exist in a migration.
     """
-    for dirpath, dirnames, filenames in os.walk(source_path, topdown=True, onerror=None):
+    walk_errors: list[SkippedEntry] = []
+
+    def _on_walk_error(exc: OSError) -> None:
+        walk_errors.append(
+            SkippedEntry(
+                path=getattr(exc, "filename", None) or source_path,
+                reason=SkipReason.UNREADABLE,
+                detail=str(exc),
+            )
+        )
+
+    for dirpath, dirnames, filenames in os.walk(
+        source_path, topdown=True, onerror=_on_walk_error
+    ):
+        while walk_errors:
+            yield ("skip", walk_errors.pop(0))
         kept_dirnames = []
         for d in dirnames:
             full = os.path.join(dirpath, d)
@@ -164,6 +179,9 @@ def walk_tree_entries(source_path: str):
                 is_hidden_or_system=is_hidden,
             )
             yield ("file", entry)
+
+    while walk_errors:
+        yield ("skip", walk_errors.pop(0))
 
 
 def scan_folder(

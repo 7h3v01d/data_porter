@@ -37,8 +37,9 @@ from .manifest import (
     sanitize_folder_name,
 )
 from .models import FolderScanResult, ScanReport
+from .safety import safe_join, validate_package_location, validate_source_roots
 
-PACKAGE_SCHEMA_VERSION = "1.0"
+PACKAGE_SCHEMA_VERSION = "1.1"
 
 
 def build_migration_plan(
@@ -58,6 +59,11 @@ def build_migration_plan(
         if f.exists
         and (selected_logical_names is None or f.logical_name in selected_logical_names)
     ]
+
+    # A source may only belong to one migration item. Parent/child or exact
+    # duplicate selections are ambiguous and are blocked rather than silently
+    # allowing the SQLite UNIQUE(source_path) constraint to choose a winner.
+    validate_source_roots(f.source_path for f in candidate_folders)
 
     raw_names = [sanitize_folder_name(f.logical_name) for f in candidate_folders]
     unique_names = make_unique_names(raw_names)
@@ -91,9 +97,11 @@ CREATE TABLE IF NOT EXISTS files (
     package_rel_path TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
     modified_utc TEXT,
+    source_mtime_ns INTEGER,
     is_cloud_placeholder INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
     sha256 TEXT,
+    hash_kind TEXT NOT NULL DEFAULT 'none',
     error TEXT,
     updated_utc TEXT
 );
@@ -111,6 +119,16 @@ def init_package_db(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(_DB_SCHEMA)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+        if "hash_kind" not in columns:
+            conn.execute("ALTER TABLE files ADD COLUMN hash_kind TEXT NOT NULL DEFAULT 'none'")
+            conn.execute(
+                "UPDATE files SET hash_kind = CASE "
+                "WHEN sha256 LIKE 'partial:%' THEN 'sha256_sampled_v1' "
+                "WHEN sha256 IS NOT NULL THEN 'sha256_full' ELSE 'none' END"
+            )
+        if "source_mtime_ns" not in columns:
+            conn.execute("ALTER TABLE files ADD COLUMN source_mtime_ns INTEGER")
         conn.commit()
     finally:
         conn.close()
@@ -129,11 +147,31 @@ def create_package(
     folder to the plan) -- it won't clobber already-captured data/ content,
     it only ensures directories exist and rewrites the manifest + metadata.
     """
+    validate_source_roots(item.source_path for item in manifest.items)
+    validate_package_location(package_dir, (item.source_path for item in manifest.items))
+
+    existing_manifest_path = os.path.join(package_dir, "migration.json")
+    if os.path.isfile(existing_manifest_path):
+        try:
+            with open(existing_manifest_path, "r", encoding="utf-8") as existing_file:
+                existing_data = json.load(existing_file)
+            existing_id = existing_data.get("migration_id")
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"existing package manifest cannot be read safely: {existing_manifest_path}: {exc}"
+            ) from exc
+        if existing_id and existing_id != manifest.migration_id:
+            from .safety import SafetyError
+            raise SafetyError(
+                "refusing to overwrite an existing migration package with a different plan. "
+                "Choose a new empty package folder or resume the existing package."
+            )
+
     os.makedirs(package_dir, exist_ok=True)
     for sub in ("data", "metadata", "logs"):
-        os.makedirs(os.path.join(package_dir, sub), exist_ok=True)
+        os.makedirs(safe_join(package_dir, sub), exist_ok=True)
     for item in manifest.items:
-        os.makedirs(os.path.join(package_dir, item.package_path), exist_ok=True)
+        os.makedirs(safe_join(package_dir, item.package_path), exist_ok=True)
 
     manifest_path = os.path.join(package_dir, "migration.json")
     with open(manifest_path, "w", encoding="utf-8") as f:

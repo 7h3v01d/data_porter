@@ -145,10 +145,11 @@ def resolve_known_folder(logical_name: str) -> ResolvedFolder:
             path = _resolve_via_ctypes(guid)
             method = ResolutionMethod.CTYPES
         if not path:
-            # Even on Windows, fall back so the app degrades gracefully
-            # rather than crashing if both API paths are unavailable.
-            path = _resolve_via_dev_fallback(fallback_relative)
-            method = ResolutionMethod.DEV_FALLBACK
+            # On a real Windows migration, guessing a user-data destination
+            # is unsafe. Report an unresolved folder and require the caller
+            # to stop rather than silently writing to a home-directory guess.
+            path = None
+            method = ResolutionMethod.NOT_FOUND
     else:
         path = _resolve_via_dev_fallback(fallback_relative)
         method = ResolutionMethod.DEV_FALLBACK

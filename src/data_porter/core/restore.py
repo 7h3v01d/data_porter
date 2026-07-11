@@ -1,39 +1,9 @@
-"""
-Restore: writes a captured (and ideally verified) migration package back
-onto a destination machine.
-
-The one rule that makes Win10<->Win11, different account names, and
-redirected folders all work without special-casing (per the spec): every
-KNOWN_FOLDER_* item is resolved against *this* machine's real Known
-Folders at restore time via known_folders.py -- never against any path
-recorded back on the source machine. CUSTOM items have no such guarantee
-(a custom path like "D:\\Family Photos" may not exist in the same place on
-the new PC), so they fall back to their original source_path and are
-flagged unresolved unless the caller supplies an explicit override.
-
-Safety pattern mirrors capture.py: every file is written to a
-``.dataporter-restore-partial`` staged name in the destination and only
-renamed into place after the write (and size check) succeeds, so an
-interrupted restore can never leave a half-written destination file
-looking valid, and a failed restore can't corrupt a pre-existing file
-that was about to be replaced.
-
-Conflict policy (spec section 6):
-  * "skip"             - leave an existing destination file untouched
-  * "replace"          - always overwrite the destination file
-  * "replace_if_newer" - overwrite only if the migrated file is newer
-                          than what's already there
-  * "keep_both"        - restore the migrated file under a disambiguated
-                          name, e.g. "Budget - migrated 2026-07-11.xlsx"
-
-"Ask for each conflict" from the spec is a UI-layer concern: a caller
-that wants that resolves the policy per file before calling restore_one()
-directly, rather than driving the whole run_restore() loop.
-"""
+"""Safe, resumable restoration of a verified Data Porter package."""
 
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import shutil
 import sqlite3
@@ -41,18 +11,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from .capture import STAGING_SUFFIX, _compute_hash, _now
+from .capture import (
+    HASH_NONE,
+    _compute_hash_for_kind,
+    _hash_file_full,
+    _infer_hash_kind,
+    _now,
+)
 from .known_folders import resolve_known_folder
 from .manifest import MigrationManifest, known_folder_name_for_restore_target
+from .package import init_package_db
+from .safety import path_is_within, paths_overlap, safe_join
 
 RESTORE_STAGING_SUFFIX = ".dataporter-restore-partial"
-
 VALID_CONFLICT_POLICIES = ("skip", "replace", "replace_if_newer", "keep_both")
-
-
-# --------------------------------------------------------------------------
-# Destination resolution
-# --------------------------------------------------------------------------
 
 
 @dataclass
@@ -72,78 +44,74 @@ def resolve_destination_roots(
     manifest: MigrationManifest,
     custom_overrides: Optional[dict[str, str]] = None,
 ) -> dict[str, ResolvedDestination]:
-    """
-    For every item in the manifest, work out where it should land on this
-    (destination) machine. Returns a dict keyed by logical_folder.
-    """
     custom_overrides = custom_overrides or {}
     resolved: dict[str, ResolvedDestination] = {}
 
     for item in manifest.items:
         if item.restore_target == "CUSTOM":
             if item.logical_folder in custom_overrides:
+                destination = os.path.abspath(os.path.expanduser(custom_overrides[item.logical_folder]))
                 resolved[item.logical_folder] = ResolvedDestination(
-                    logical_folder=item.logical_folder,
-                    restore_target=item.restore_target,
-                    path=custom_overrides[item.logical_folder],
-                    method="user_override",
-                    resolved=True,
+                    item.logical_folder,
+                    item.restore_target,
+                    destination,
+                    "user_override",
+                    True,
                 )
             else:
                 resolved[item.logical_folder] = ResolvedDestination(
-                    logical_folder=item.logical_folder,
-                    restore_target=item.restore_target,
-                    path=item.source_path,
-                    method="source_path_fallback",
-                    resolved=False,
-                    warning=(
-                        "Custom folder has no destination mapping -- falling back to "
-                        f"its original path ({item.source_path}). Confirm this is correct "
-                        "on the destination machine, or supply a custom_overrides entry."
-                    ),
+                    item.logical_folder,
+                    item.restore_target,
+                    item.source_path,
+                    "source_path_fallback",
+                    False,
+                    "Custom folder has no confirmed destination. Supply an explicit override.",
                 )
             continue
 
         known_name = known_folder_name_for_restore_target(item.restore_target)
         if known_name is None:
             resolved[item.logical_folder] = ResolvedDestination(
-                logical_folder=item.logical_folder,
-                restore_target=item.restore_target,
-                path=None,
-                method="unknown_target",
-                resolved=False,
-                warning=f"Unrecognised restore_target: {item.restore_target!r}",
+                item.logical_folder,
+                item.restore_target,
+                None,
+                "unknown_target",
+                False,
+                f"Unrecognised restore_target: {item.restore_target!r}",
             )
             continue
 
         rf = resolve_known_folder(known_name)
+        is_resolved = bool(rf.path)
+        warning = None if is_resolved else f"Could not safely resolve {known_name} on this machine"
         resolved[item.logical_folder] = ResolvedDestination(
-            logical_folder=item.logical_folder,
-            restore_target=item.restore_target,
-            path=rf.path,
-            method=rf.method,
-            resolved=bool(rf.path),
-            warning=None if rf.path else f"Could not resolve {known_name} on this machine",
+            item.logical_folder,
+            item.restore_target,
+            rf.path,
+            rf.method,
+            is_resolved,
+            warning,
         )
 
     return resolved
 
 
 def _rel_within_item(package_rel_path: str, item_package_path: str) -> str:
-    prefix = item_package_path.rstrip("/") + "/"
-    if package_rel_path.startswith(prefix):
-        return package_rel_path[len(prefix):]
-    return os.path.basename(package_rel_path)
+    stored = package_rel_path.replace("\\", "/")
+    prefix = item_package_path.replace("\\", "/").rstrip("/") + "/"
+    if not stored.startswith(prefix):
+        raise ValueError(
+            f"package file {package_rel_path!r} is not within item path {item_package_path!r}"
+        )
+    rel = stored[len(prefix) :]
+    if not rel:
+        raise ValueError("package file has an empty item-relative path")
+    return rel
 
 
 def _dest_path_for(dest_root: str, package_rel_path: str, item_package_path: str) -> str:
-    rel = _rel_within_item(package_rel_path, item_package_path)
-    return os.path.join(dest_root, *rel.split("/"))
+    return safe_join(dest_root, _rel_within_item(package_rel_path, item_package_path))
 
-
-# --------------------------------------------------------------------------
-# Restore-state tracking (a sibling table in the same package_state.sqlite)
-# --------------------------------------------------------------------------
 
 _RESTORE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS restore_state (
@@ -159,6 +127,7 @@ CREATE INDEX IF NOT EXISTS idx_restore_status ON restore_state(status);
 
 
 def init_restore_state(db_path: str) -> None:
+    init_package_db(db_path)
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(_RESTORE_SCHEMA)
@@ -168,23 +137,14 @@ def init_restore_state(db_path: str) -> None:
 
 
 def _seed_restore_state(conn: sqlite3.Connection) -> int:
-    """INSERT OR IGNORE a pending restore_state row for every successfully
-    captured file that doesn't have one yet. Safe to call repeatedly."""
     cur = conn.execute(
         """
         INSERT OR IGNORE INTO restore_state (file_id, status, updated_utc)
-        SELECT id, 'pending', ?
-        FROM files
-        WHERE status IN ('copied', 'verified')
+        SELECT id, 'pending', ? FROM files WHERE status IN ('copied', 'verified')
         """,
         (_now(),),
     )
     return cur.rowcount
-
-
-# --------------------------------------------------------------------------
-# Preview
-# --------------------------------------------------------------------------
 
 
 @dataclass
@@ -214,11 +174,33 @@ class RestorePreview:
             "package_migration_id": self.package_migration_id,
             "package_source_computer": self.package_source_computer,
             "package_created_utc": self.package_created_utc,
-            "items": [dataclasses.asdict(i) for i in self.items],
+            "items": [dataclasses.asdict(item) for item in self.items],
             "required_bytes": self.required_bytes,
             "free_bytes_by_root": self.free_bytes_by_root,
             "unresolved_items": self.unresolved_items,
         }
+
+
+def _existing_parent(path: str) -> str:
+    current = os.path.abspath(path)
+    while not os.path.exists(current):
+        parent = os.path.dirname(current)
+        if parent == current:
+            return "."
+        current = parent
+    return current
+
+
+def _block_package_destination_overlap(
+    package_dir: str, destinations: dict[str, ResolvedDestination]
+) -> None:
+    for dest in destinations.values():
+        if dest.resolved and dest.path and paths_overlap(package_dir, dest.path):
+            dest.resolved = False
+            dest.warning = (
+                "Destination overlaps the migration package. Move the package outside "
+                "the folder being restored and run the preview again."
+            )
 
 
 def build_restore_preview(
@@ -226,19 +208,15 @@ def build_restore_preview(
     manifest: MigrationManifest,
     custom_overrides: Optional[dict[str, str]] = None,
 ) -> RestorePreview:
-    """
-    Read-only: resolves every item's destination, counts what would be
-    written, flags pre-existing conflicts, and checks free space -- all
-    before a single byte is restored. This is the "Restore preview"
-    screen from the spec (section 5).
-    """
     db_path = os.path.join(package_dir, "package_state.sqlite")
+    init_restore_state(db_path)
     destinations = resolve_destination_roots(manifest, custom_overrides)
+    _block_package_destination_overlap(package_dir, destinations)
 
     preview = RestorePreview(
-        package_migration_id=manifest.migration_id,
-        package_source_computer=manifest.source.computer_name,
-        package_created_utc=manifest.created_utc,
+        manifest.migration_id,
+        manifest.source.computer_name,
+        manifest.created_utc,
     )
 
     conn = sqlite3.connect(db_path)
@@ -246,34 +224,33 @@ def build_restore_preview(
     try:
         for item in manifest.items:
             dest = destinations[item.logical_folder]
-
             rows = conn.execute(
                 "SELECT package_rel_path, size_bytes FROM files "
-                "WHERE item_logical_folder = ? AND status IN ('copied', 'verified')",
+                "WHERE item_logical_folder=? AND status IN ('copied', 'verified')",
                 (item.logical_folder,),
             ).fetchall()
-
-            item_bytes = sum(r["size_bytes"] for r in rows)
+            item_bytes = sum(row["size_bytes"] for row in rows)
             conflicts = 0
-            if dest.path:
-                for r in rows:
-                    dp = _dest_path_for(dest.path, r["package_rel_path"], item.package_path)
-                    if os.path.exists(dp):
+            if dest.resolved and dest.path:
+                for row in rows:
+                    # Validate both the package path and destination path now.
+                    safe_join(package_dir, row["package_rel_path"])
+                    candidate = _dest_path_for(dest.path, row["package_rel_path"], item.package_path)
+                    if os.path.exists(candidate):
                         conflicts += 1
 
             preview.items.append(
                 RestoreItemPreview(
-                    logical_folder=item.logical_folder,
-                    restore_target=item.restore_target,
-                    destination_root=dest.path,
-                    destination_resolved=dest.resolved,
-                    destination_warning=dest.warning,
-                    file_count=len(rows),
-                    total_bytes=item_bytes,
-                    existing_conflicts=conflicts,
+                    item.logical_folder,
+                    item.restore_target,
+                    dest.path,
+                    dest.resolved,
+                    dest.warning,
+                    len(rows),
+                    item_bytes,
+                    conflicts,
                 )
             )
-
             if not dest.resolved:
                 preview.unresolved_items.append(item.logical_folder)
             else:
@@ -281,7 +258,7 @@ def build_restore_preview(
                 if dest.path not in preview.free_bytes_by_root:
                     try:
                         preview.free_bytes_by_root[dest.path] = shutil.disk_usage(
-                            dest.path if os.path.isdir(dest.path) else os.path.dirname(dest.path) or "."
+                            _existing_parent(dest.path)
                         ).free
                     except OSError:
                         preview.free_bytes_by_root[dest.path] = None
@@ -289,11 +266,6 @@ def build_restore_preview(
         conn.close()
 
     return preview
-
-
-# --------------------------------------------------------------------------
-# Restore
-# --------------------------------------------------------------------------
 
 
 @dataclass
@@ -312,18 +284,103 @@ class RestoreSummary:
         return dataclasses.asdict(self)
 
 
+
 def _keep_both_path(dest_path: str) -> str:
     base, ext = os.path.splitext(dest_path)
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     candidate = f"{base} - migrated {date_str}{ext}"
     if not os.path.exists(candidate):
         return candidate
-    n = 2
+    number = 2
     while True:
-        candidate2 = f"{base} - migrated {date_str} ({n}){ext}"
-        if not os.path.exists(candidate2):
-            return candidate2
-        n += 1
+        candidate = f"{base} - migrated {date_str} ({number}){ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        number += 1
+
+
+def _paths_have_same_content(
+    package_path: str,
+    destination_path: str,
+    expected_size: int,
+    stored_hash: Optional[str],
+    hash_kind: Optional[str],
+) -> bool:
+    if not os.path.isfile(package_path) or not os.path.isfile(destination_path):
+        return False
+    if os.path.getsize(package_path) != expected_size or os.path.getsize(destination_path) != expected_size:
+        return False
+    kind = _infer_hash_kind(stored_hash, hash_kind)
+    if stored_hash and kind != HASH_NONE:
+        return _compute_hash_for_kind(destination_path, expected_size, kind) == stored_hash
+    # Recovery-only cost: when capture had no digest, compare both files fully
+    # before declaring an interrupted restore committed.
+    return _hash_file_full(package_path) == _hash_file_full(destination_path)
+
+
+def _reconcile_interrupted_restores(
+    conn: sqlite3.Connection,
+    package_dir: str,
+    manifest: MigrationManifest,
+    destinations: dict[str, ResolvedDestination],
+) -> None:
+    item_by_logical = {item.logical_folder: item for item in manifest.items}
+    rows = conn.execute(
+        """
+        SELECT rs.file_id, rs.dest_path, f.item_logical_folder, f.package_rel_path,
+               f.size_bytes, f.sha256, f.hash_kind
+        FROM restore_state rs JOIN files f ON f.id=rs.file_id
+        WHERE rs.status='restoring'
+        """
+    ).fetchall()
+    for row in rows:
+        item = item_by_logical.get(row["item_logical_folder"])
+        dest = destinations.get(row["item_logical_folder"])
+        if not item or not dest or not dest.resolved or not dest.path:
+            conn.execute(
+                "UPDATE restore_state SET status='pending', error=NULL, updated_utc=? WHERE file_id=?",
+                (_now(), row["file_id"]),
+            )
+            continue
+
+        package_path = safe_join(package_dir, row["package_rel_path"])
+        stored_dest = row["dest_path"]
+        if not stored_dest or not path_is_within(dest.path, stored_dest) or path_is_within(package_dir, stored_dest):
+            conn.execute(
+                "UPDATE restore_state SET status='pending', dest_path=NULL, error=NULL, updated_utc=? "
+                "WHERE file_id=?",
+                (_now(), row["file_id"]),
+            )
+            continue
+
+        staged = stored_dest + RESTORE_STAGING_SUFFIX
+        if _paths_have_same_content(
+            package_path,
+            stored_dest,
+            row["size_bytes"],
+            row["sha256"],
+            row["hash_kind"],
+        ):
+            if os.path.exists(staged):
+                try:
+                    os.remove(staged)
+                except OSError:
+                    pass
+            conn.execute(
+                "UPDATE restore_state SET status='restored', error=NULL, updated_utc=? WHERE file_id=?",
+                (_now(), row["file_id"]),
+            )
+        else:
+            if os.path.exists(staged):
+                try:
+                    os.remove(staged)
+                except OSError:
+                    pass
+            conn.execute(
+                "UPDATE restore_state SET status='pending', error=NULL, updated_utc=? WHERE file_id=?",
+                (_now(), row["file_id"]),
+            )
+    conn.commit()
 
 
 def run_restore(
@@ -334,28 +391,16 @@ def run_restore(
     hash_check: bool = True,
     reseed: bool = True,
 ) -> RestoreSummary:
-    """
-    Restore every captured file to its resolved destination, honouring
-    ``conflict_policy`` for anything already sitting at the destination.
-
-    Resumable, exactly like capture: progress is journaled per-file to
-    ``restore_state`` in the same package_state.sqlite, so re-running this
-    against the same package_dir picks up where a previous run left off
-    (only pending/failed rows are (re)attempted) instead of restarting.
-    """
-    assert conflict_policy in VALID_CONFLICT_POLICIES, (
-        f"conflict_policy must be one of {VALID_CONFLICT_POLICIES}, got {conflict_policy!r}"
-    )
+    if conflict_policy not in VALID_CONFLICT_POLICIES:
+        raise ValueError(f"invalid conflict policy: {conflict_policy!r}")
 
     summary = RestoreSummary()
     db_path = os.path.join(package_dir, "package_state.sqlite")
     init_restore_state(db_path)
-
     destinations = resolve_destination_roots(manifest, custom_overrides)
+    _block_package_destination_overlap(package_dir, destinations)
     item_by_logical = {item.logical_folder: item for item in manifest.items}
-    for logical_folder, dest in destinations.items():
-        if not dest.resolved:
-            summary.blocked_items.append(logical_folder)
+    summary.blocked_items = [name for name, dest in destinations.items() if not dest.resolved]
 
     errors_path = os.path.join(package_dir, "metadata", "restore_errors.jsonl")
     os.makedirs(os.path.dirname(errors_path), exist_ok=True)
@@ -366,82 +411,87 @@ def run_restore(
         if reseed:
             summary.seeded = _seed_restore_state(conn)
             conn.commit()
+        _reconcile_interrupted_restores(conn, package_dir, manifest, destinations)
 
         rows = conn.execute(
             """
             SELECT f.id AS file_id, f.item_logical_folder, f.package_rel_path,
-                   f.size_bytes, f.modified_utc, f.sha256
-            FROM files f
-            JOIN restore_state rs ON rs.file_id = f.id
-            WHERE rs.status IN ('pending', 'failed')
-            ORDER BY f.id
+                   f.size_bytes, f.modified_utc, f.sha256, f.hash_kind,
+                   rs.error AS restore_error
+            FROM files f JOIN restore_state rs ON rs.file_id=f.id
+            WHERE rs.status IN ('pending', 'failed') ORDER BY f.id
             """
         ).fetchall()
 
-        import json as _json
-
         with open(errors_path, "a", encoding="utf-8") as error_log:
             for row in rows:
-                logical_folder = row["item_logical_folder"]
-                item = item_by_logical.get(logical_folder)
-                dest = destinations.get(logical_folder)
-
-                if item is None or dest is None or not dest.resolved:
-                    # Destination couldn't be resolved for this item at all
-                    # -- don't guess, leave it pending for a future run
-                    # once the caller supplies an override / the folder
-                    # becomes resolvable.
+                logical = row["item_logical_folder"]
+                item = item_by_logical.get(logical)
+                dest = destinations.get(logical)
+                if item is None or dest is None or not dest.resolved or not dest.path:
                     continue
 
-                package_file_path = os.path.join(package_dir, row["package_rel_path"])
-                dest_path = _dest_path_for(dest.path, row["package_rel_path"], item.package_path)
+                try:
+                    package_file_path = safe_join(package_dir, row["package_rel_path"])
+                    dest_path = _dest_path_for(dest.path, row["package_rel_path"], item.package_path)
+                    if path_is_within(package_dir, dest_path):
+                        raise ValueError("restore destination is inside the migration package")
+                except Exception as exc:
+                    conn.execute(
+                        "UPDATE restore_state SET status='failed', error=?, updated_utc=? WHERE file_id=?",
+                        (str(exc), _now(), row["file_id"]),
+                    )
+                    conn.commit()
+                    summary.failed += 1
+                    summary.errors.append({"package_rel_path": row["package_rel_path"], "error": str(exc)})
+                    continue
 
                 conflict = None
                 final_dest_path = dest_path
-
-                if os.path.exists(dest_path):
+                verification_repair = str(row["restore_error"] or "").startswith("verification:")
+                if os.path.exists(dest_path) and verification_repair:
+                    # Post-restore verification proved this destination is
+                    # damaged. Repair it regardless of the normal conflict
+                    # policy; otherwise replace_if_newer could preserve the
+                    # corrupt file merely because its timestamp is newer.
+                    conflict = "verification_repair"
+                elif os.path.exists(dest_path):
                     if conflict_policy == "skip":
                         conn.execute(
-                            "UPDATE restore_state SET status='skipped', dest_path=?, "
-                            "conflict='existing', updated_utc=? WHERE file_id=?",
+                            "UPDATE restore_state SET status='skipped', dest_path=?, conflict='existing', "
+                            "error=NULL, updated_utc=? WHERE file_id=?",
                             (dest_path, _now(), row["file_id"]),
                         )
                         conn.commit()
                         summary.skipped_policy += 1
                         continue
-
                     if conflict_policy == "replace_if_newer":
                         dest_mtime = os.path.getmtime(dest_path)
                         source_mtime = None
                         if row["modified_utc"]:
                             try:
-                                source_mtime = datetime.fromisoformat(
-                                    row["modified_utc"]
-                                ).timestamp()
+                                source_mtime = datetime.fromisoformat(row["modified_utc"]).timestamp()
                             except ValueError:
                                 source_mtime = None
                         if source_mtime is None or source_mtime <= dest_mtime:
                             conn.execute(
                                 "UPDATE restore_state SET status='skipped', dest_path=?, "
-                                "conflict='existing_newer_or_equal', updated_utc=? WHERE file_id=?",
+                                "conflict='existing_newer_or_equal', error=NULL, updated_utc=? WHERE file_id=?",
                                 (dest_path, _now(), row["file_id"]),
                             )
                             conn.commit()
                             summary.skipped_policy += 1
                             continue
                         conflict = "existing_older_replaced"
-
                     elif conflict_policy == "keep_both":
                         final_dest_path = _keep_both_path(dest_path)
                         conflict = "existing_kept_both"
-
-                    elif conflict_policy == "replace":
+                    else:
                         conflict = "existing_replaced"
 
                 staged_path = final_dest_path + RESTORE_STAGING_SUFFIX
-
                 conn.execute(
-                    "UPDATE restore_state SET status='restoring', dest_path=?, conflict=?, "
+                    "UPDATE restore_state SET status='restoring', dest_path=?, conflict=?, error=NULL, "
                     "updated_utc=? WHERE file_id=?",
                     (final_dest_path, conflict, _now(), row["file_id"]),
                 )
@@ -449,39 +499,36 @@ def run_restore(
 
                 try:
                     if not os.path.isfile(package_file_path):
-                        raise FileNotFoundError(
-                            f"package file missing: {package_file_path}"
-                        )
-
+                        raise FileNotFoundError(f"package file missing: {package_file_path}")
                     os.makedirs(os.path.dirname(final_dest_path), exist_ok=True)
+                    if os.path.exists(staged_path):
+                        os.remove(staged_path)
                     shutil.copy2(package_file_path, staged_path)
-
                     staged_size = os.path.getsize(staged_path)
                     if staged_size != row["size_bytes"]:
                         raise IOError(
-                            f"size mismatch after restore copy: expected={row['size_bytes']} "
-                            f"actual={staged_size}"
+                            f"size mismatch after restore: expected={row['size_bytes']} actual={staged_size}"
                         )
 
-                    if hash_check and row["sha256"] and not str(row["sha256"]).startswith("partial:"):
-                        recomputed = _compute_hash(staged_path, staged_size, "full")
-                        if recomputed != row["sha256"]:
-                            raise IOError("hash mismatch after restore copy")
+                    if hash_check:
+                        kind = _infer_hash_kind(row["sha256"], row["hash_kind"])
+                        if row["sha256"] and kind != HASH_NONE:
+                            if _compute_hash_for_kind(staged_path, staged_size, kind) != row["sha256"]:
+                                raise IOError("hash mismatch after restore copy")
+                        elif _hash_file_full(package_file_path) != _hash_file_full(staged_path):
+                            raise IOError("package/staged content mismatch after restore copy")
 
                     os.replace(staged_path, final_dest_path)
-
                     conn.execute(
-                        "UPDATE restore_state SET status='restored', dest_path=?, error=NULL, "
-                        "updated_utc=? WHERE file_id=?",
+                        "UPDATE restore_state SET status='restored', dest_path=?, error=NULL, updated_utc=? "
+                        "WHERE file_id=?",
                         (final_dest_path, _now(), row["file_id"]),
                     )
                     conn.commit()
-
                     summary.restored += 1
                     summary.total_bytes_restored += staged_size
                     if conflict == "existing_kept_both":
                         summary.conflicts_renamed += 1
-
                 except Exception as exc:
                     if os.path.exists(staged_path):
                         try:
@@ -489,13 +536,12 @@ def run_restore(
                         except OSError:
                             pass
                     conn.execute(
-                        "UPDATE restore_state SET status='failed', error=?, updated_utc=? "
-                        "WHERE file_id=?",
+                        "UPDATE restore_state SET status='failed', error=?, updated_utc=? WHERE file_id=?",
                         (str(exc), _now(), row["file_id"]),
                     )
                     conn.commit()
                     error_log.write(
-                        _json.dumps(
+                        json.dumps(
                             {
                                 "package_rel_path": row["package_rel_path"],
                                 "dest_path": final_dest_path,
@@ -505,18 +551,16 @@ def run_restore(
                         )
                         + "\n"
                     )
+                    error_log.flush()
                     summary.failed += 1
-                    summary.errors.append(
-                        {"package_rel_path": row["package_rel_path"], "error": str(exc)}
-                    )
+                    summary.errors.append({"package_rel_path": row["package_rel_path"], "error": str(exc)})
 
-        already_done = conn.execute(
-            "SELECT COUNT(*) FROM restore_state WHERE status = 'restored'"
+        done = conn.execute(
+            "SELECT COUNT(*) FROM restore_state WHERE status='restored'"
         ).fetchone()[0]
-        summary.already_done = already_done - summary.restored
+        summary.already_done = max(0, done - summary.restored)
     finally:
         conn.close()
-
     return summary
 
 
@@ -526,16 +570,11 @@ def restore_status(package_dir: str) -> dict:
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT status, COUNT(*) as n FROM restore_state GROUP BY status"
+            "SELECT status, COUNT(*) FROM restore_state GROUP BY status"
         ).fetchall()
-        return {status: n for status, n in rows}
+        return {status: count for status, count in rows}
     finally:
         conn.close()
-
-
-# --------------------------------------------------------------------------
-# Post-restore verification
-# --------------------------------------------------------------------------
 
 
 @dataclass
@@ -551,68 +590,50 @@ class RestoreVerifySummary:
 
 
 def verify_restore(package_dir: str, level: str = "balanced") -> RestoreVerifySummary:
-    """
-    Re-checks every file this run actually restored against what's really
-    sitting at its destination path now -- the "post-restore verification"
-    step from the spec (section 7). Distinct from verify.py, which checks
-    the *package*, not the destination the files were written to.
-    """
-    assert level in ("fast", "balanced", "full")
-
+    if level not in ("fast", "balanced", "full"):
+        raise ValueError("level must be fast, balanced, or full")
     db_path = os.path.join(package_dir, "package_state.sqlite")
+    init_restore_state(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     summary = RestoreVerifySummary()
-
     try:
         rows = conn.execute(
             """
-            SELECT rs.file_id, rs.dest_path, f.size_bytes, f.sha256
-            FROM restore_state rs
-            JOIN files f ON f.id = rs.file_id
-            WHERE rs.status = 'restored'
-            ORDER BY rs.file_id
+            SELECT rs.file_id, rs.dest_path, f.size_bytes, f.sha256, f.hash_kind
+            FROM restore_state rs JOIN files f ON f.id=rs.file_id
+            WHERE rs.status='restored' ORDER BY rs.file_id
             """
         ).fetchall()
-
         for row in rows:
             summary.checked += 1
             dest_path = row["dest_path"]
-
+            problem = None
             if not dest_path or not os.path.isfile(dest_path):
                 summary.missing += 1
-                summary.problems.append({"path": dest_path, "problem": "missing at destination"})
-                continue
-
-            actual_size = os.path.getsize(dest_path)
-            if actual_size != row["size_bytes"]:
-                summary.failed += 1
-                summary.problems.append(
-                    {
-                        "path": dest_path,
-                        "problem": f"size mismatch: expected {row['size_bytes']}, found {actual_size}",
-                    }
-                )
-                continue
-
-            if level == "fast":
-                summary.verified += 1
-                continue
-
-            stored = row["sha256"]
-            if not stored or str(stored).startswith("partial:"):
-                # Nothing trustworthy to compare a full hash against --
-                # size match is the best available signal.
-                summary.verified += 1
-                continue
-
-            recomputed = _compute_hash(dest_path, actual_size, "full" if level == "full" else "balanced")
-            if recomputed == stored:
-                summary.verified += 1
+                problem = "missing at destination"
             else:
-                summary.failed += 1
-                summary.problems.append({"path": dest_path, "problem": "hash mismatch"})
+                actual_size = os.path.getsize(dest_path)
+                if actual_size != row["size_bytes"]:
+                    summary.failed += 1
+                    problem = f"size mismatch: expected {row['size_bytes']}, found {actual_size}"
+                elif level != "fast" and row["sha256"]:
+                    kind = _infer_hash_kind(row["sha256"], row["hash_kind"])
+                    if kind != HASH_NONE and _compute_hash_for_kind(dest_path, actual_size, kind) != row["sha256"]:
+                        summary.failed += 1
+                        problem = "hash mismatch"
+
+            if problem:
+                summary.problems.append({"path": dest_path, "problem": problem})
+                # Make a subsequent restore capable of repairing the damaged
+                # or missing destination automatically.
+                conn.execute(
+                    "UPDATE restore_state SET status='failed', error=?, updated_utc=? WHERE file_id=?",
+                    (f"verification: {problem}", _now(), row["file_id"]),
+                )
+            else:
+                summary.verified += 1
+        conn.commit()
     finally:
         conn.close()
-
     return summary
