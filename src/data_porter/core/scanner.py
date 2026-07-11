@@ -102,6 +102,70 @@ class _TopN:
         return [e for _, _, e in sorted(self._heap, key=lambda t: t[0], reverse=True)]
 
 
+def walk_tree_entries(source_path: str):
+    """
+    Shared traversal core used by both ``scan_folder`` (aggregate stats)
+    and the capture step (needs the actual per-file list). Yields one of:
+
+      ("file", FileEntry)
+      ("skip", SkippedEntry)
+
+    Reparse-point pruning happens once here so scanning and capturing can
+    never disagree about which files exist in a migration.
+    """
+    for dirpath, dirnames, filenames in os.walk(source_path, topdown=True, onerror=None):
+        kept_dirnames = []
+        for d in dirnames:
+            full = os.path.join(dirpath, d)
+            try:
+                st = os.lstat(full)
+            except OSError as exc:
+                yield ("skip", SkippedEntry(path=full, reason=SkipReason.UNREADABLE, detail=str(exc)))
+                continue
+            is_reparse, _, _ = _classify_entry(full, st)
+            if is_reparse:
+                yield ("skip", SkippedEntry(path=full, reason=SkipReason.REPARSE_POINT))
+                continue
+            kept_dirnames.append(d)
+        dirnames[:] = kept_dirnames
+
+        for fname in filenames:
+            full = os.path.join(dirpath, fname)
+
+            if len(full) > MAX_PATH_WARN_LENGTH and _is_windows():
+                yield (
+                    "skip",
+                    SkippedEntry(
+                        path=full,
+                        reason=SkipReason.TOO_LONG_PATH,
+                        detail=f"{len(full)} characters",
+                    ),
+                )
+                # Not a `continue` -- still attempt the file itself below.
+
+            try:
+                st = os.lstat(full)
+            except OSError as exc:
+                yield ("skip", SkippedEntry(path=full, reason=SkipReason.PERMISSION_DENIED, detail=str(exc)))
+                continue
+
+            is_reparse, is_cloud, is_hidden = _classify_entry(full, st)
+
+            if is_reparse:
+                yield ("skip", SkippedEntry(path=full, reason=SkipReason.REPARSE_POINT))
+                continue
+
+            entry = FileEntry(
+                path=full,
+                size_bytes=st.st_size,
+                modified_utc=_iso(st.st_mtime),
+                is_reparse_point=False,
+                is_cloud_placeholder=is_cloud,
+                is_hidden_or_system=is_hidden,
+            )
+            yield ("file", entry)
+
+
 def scan_folder(
     source_path: str,
     logical_name: str,
@@ -131,88 +195,32 @@ def scan_folder(
     newest = _TopN(top_n, key=lambda e: e.modified_utc or "")
     latest_mtime: Optional[float] = None
 
-    for dirpath, dirnames, filenames in os.walk(source_path, topdown=True, onerror=None):
-        # Prune reparse-point directories in place so os.walk doesn't
-        # descend into them (prevents junction loops).
-        kept_dirnames = []
-        for d in dirnames:
-            full = os.path.join(dirpath, d)
-            try:
-                st = os.lstat(full)
-            except OSError as exc:
-                result.skipped.append(
-                    SkippedEntry(path=full, reason=SkipReason.UNREADABLE, detail=str(exc))
-                )
-                result.unreadable_count += 1
-                continue
-            is_reparse, _, _ = _classify_entry(full, st)
-            if is_reparse:
+    for kind, item in walk_tree_entries(source_path):
+        if kind == "skip":
+            result.skipped.append(item)
+            if item.reason == SkipReason.REPARSE_POINT:
                 result.reparse_points_skipped += 1
-                result.skipped.append(
-                    SkippedEntry(path=full, reason=SkipReason.REPARSE_POINT)
-                )
-                continue
-            kept_dirnames.append(d)
-        dirnames[:] = kept_dirnames
-
-        for fname in filenames:
-            full = os.path.join(dirpath, fname)
-
-            if len(full) > MAX_PATH_WARN_LENGTH and _is_windows():
-                # Still attempt it (Python + \\?\ prefixing can often cope),
-                # but record it so the review UI can surface a warning.
-                result.skipped.append(
-                    SkippedEntry(
-                        path=full,
-                        reason=SkipReason.TOO_LONG_PATH,
-                        detail=f"{len(full)} characters",
-                    )
-                )
-
-            try:
-                st = os.lstat(full)
-            except OSError as exc:
-                result.skipped.append(
-                    SkippedEntry(path=full, reason=SkipReason.PERMISSION_DENIED, detail=str(exc))
-                )
+            elif item.reason in (SkipReason.PERMISSION_DENIED, SkipReason.UNREADABLE):
                 result.unreadable_count += 1
-                continue
+            continue
 
-            is_reparse, is_cloud, is_hidden = _classify_entry(full, st)
+        entry: FileEntry = item
+        if entry.modified_utc:
+            mtime_val = entry.modified_utc
+            if latest_mtime is None or mtime_val > latest_mtime:
+                latest_mtime = mtime_val
+        if entry.is_cloud_placeholder:
+            result.cloud_placeholder_count += 1
 
-            if is_reparse:
-                result.reparse_points_skipped += 1
-                result.skipped.append(
-                    SkippedEntry(path=full, reason=SkipReason.REPARSE_POINT)
-                )
-                continue
-
-            size = st.st_size
-            mtime_iso = _iso(st.st_mtime)
-            if latest_mtime is None or st.st_mtime > latest_mtime:
-                latest_mtime = st.st_mtime
-
-            if is_cloud:
-                result.cloud_placeholder_count += 1
-
-            entry = FileEntry(
-                path=full,
-                size_bytes=size,
-                modified_utc=mtime_iso,
-                is_reparse_point=False,
-                is_cloud_placeholder=is_cloud,
-                is_hidden_or_system=is_hidden,
-            )
-
-            result.file_count += 1
-            result.total_bytes += size
-            largest.add(entry)
-            newest.add(entry)
+        result.file_count += 1
+        result.total_bytes += entry.size_bytes
+        largest.add(entry)
+        newest.add(entry)
 
     result.largest_files = largest.result()
     result.newest_files = newest.result()
     if latest_mtime is not None:
-        result.last_modified_utc = _iso(latest_mtime)
+        result.last_modified_utc = latest_mtime
 
     return result
 

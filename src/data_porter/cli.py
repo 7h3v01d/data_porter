@@ -7,10 +7,46 @@ Minimal CLI to exercise the scan engine before there's a PyQt6 front end.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
+from .core.capture import capture_status, run_capture
+from .core.manifest import MigrationManifest
+from .core.models import ScanReport, SourceEnvironment, FolderScanResult, FolderOrigin
+from .core.package import build_migration_plan, create_package, load_manifest
 from .core.report import run_source_scan, write_html_report, write_json_report
+from .core.verify import verify_package
+
+
+def _load_scan_report(json_path: str) -> ScanReport:
+    with open(json_path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    env = d["environment"]
+    report = ScanReport(
+        schema_version=d.get("schema_version", "1.0"),
+        environment=SourceEnvironment(
+            computer_name=env["computer_name"],
+            os_name=env["os_name"],
+            os_version_raw=env.get("os_version_raw", ""),
+            user_name=env["user_name"],
+            scan_started_utc=env.get("scan_started_utc", ""),
+        ),
+        scan_finished_utc=d.get("scan_finished_utc"),
+    )
+    for fd in d["folders"]:
+        report.folders.append(
+            FolderScanResult(
+                logical_name=fd["logical_name"],
+                source_path=fd["source_path"],
+                origin=FolderOrigin(fd["origin"]),
+                exists=fd.get("exists", True),
+                file_count=fd.get("file_count", 0),
+                total_bytes=fd.get("total_bytes", 0),
+                error=fd.get("error"),
+            )
+        )
+    return report
 
 
 def _human_size(num_bytes: int) -> str:
@@ -41,6 +77,31 @@ def main(argv: list[str] | None = None) -> int:
     )
     scan_p.add_argument(
         "--top-n", type=int, default=10, help="How many largest/newest files to record per folder"
+    )
+
+    plan_p = sub.add_parser("plan", help="Turn a scan report into a migration package skeleton")
+    plan_p.add_argument("--scan-json", required=True, help="Path to source_report.json from `scan`")
+    plan_p.add_argument("--package-dir", required=True, help="Where to create the migration package")
+    plan_p.add_argument(
+        "--include",
+        action="append",
+        default=None,
+        help="Logical folder name to include (repeatable). Default: include everything found.",
+    )
+
+    capture_p = sub.add_parser("capture", help="Copy selected files into the package (resumable)")
+    capture_p.add_argument("--package-dir", required=True)
+    capture_p.add_argument(
+        "--hash-level", choices=["fast", "balanced", "full"], default="balanced"
+    )
+
+    status_p = sub.add_parser("status", help="Show capture progress for a package")
+    status_p.add_argument("--package-dir", required=True)
+
+    verify_p = sub.add_parser("verify", help="Verify package contents against recorded state")
+    verify_p.add_argument("--package-dir", required=True)
+    verify_p.add_argument(
+        "--level", choices=["fast", "balanced", "full"], default="balanced"
     )
 
     args = parser.parse_args(argv)
@@ -84,6 +145,66 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(f"Reports written to:\n  {json_path}\n  {html_path}")
         return 0
+
+    if args.command == "plan":
+        scan_report = _load_scan_report(args.scan_json)
+        include = set(args.include) if args.include else None
+        manifest = build_migration_plan(scan_report, selected_logical_names=include)
+        manifest_path = create_package(args.package_dir, manifest, scan_report=scan_report)
+
+        print(f"Package created at: {args.package_dir}")
+        print(f"Manifest: {manifest_path}")
+        print(f"Migration ID: {manifest.migration_id}")
+        print()
+        for item in manifest.items:
+            print(
+                f"  {item.logical_folder:<20} -> {item.package_path:<20} "
+                f"{item.file_count:>7,} files, restore_target={item.restore_target}"
+            )
+        if not manifest.items:
+            print("  (nothing selected -- check --include names against the scan report)")
+        return 0
+
+    if args.command == "capture":
+        manifest = load_manifest(args.package_dir)
+        print(f"Capturing into {args.package_dir} (hash level: {args.hash_level})...", file=sys.stderr)
+        summary = run_capture(args.package_dir, manifest, hash_level=args.hash_level)
+
+        print()
+        print(f"Newly seeded : {summary.seeded}")
+        print(f"Copied       : {summary.copied}  ({_human_size(summary.total_bytes_copied)})")
+        print(f"Already done : {summary.already_done}")
+        print(f"Failed       : {summary.failed}")
+        if summary.errors:
+            print()
+            print("Errors:")
+            for e in summary.errors[:20]:
+                print(f"  {e['source_path']}: {e['error']}")
+            if len(summary.errors) > 20:
+                print(f"  ...and {len(summary.errors) - 20} more (see metadata/errors.jsonl)")
+        return 0 if summary.failed == 0 else 2
+
+    if args.command == "status":
+        status = capture_status(args.package_dir)
+        print(f"Status for {args.package_dir}:")
+        for state, info in status.items():
+            print(f"  {state:<10} {info['count']:>7,} files  {_human_size(info['bytes'])}")
+        return 0
+
+    if args.command == "verify":
+        print(f"Verifying {args.package_dir} (level: {args.level})...", file=sys.stderr)
+        summary = verify_package(args.package_dir, level=args.level)
+        print()
+        print(f"Checked  : {summary.checked}")
+        print(f"Verified : {summary.verified}")
+        print(f"Failed   : {summary.failed}")
+        print(f"Missing  : {summary.missing}")
+        if summary.problems:
+            print()
+            print("Problems:")
+            for p in summary.problems[:20]:
+                print(f"  {p['path']}: {p['problem']}")
+        return 0 if summary.failed == 0 and summary.missing == 0 else 2
 
     return 1
 
