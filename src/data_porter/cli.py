@@ -15,7 +15,19 @@ from .core.capture import capture_status, run_capture
 from .core.manifest import MigrationManifest
 from .core.models import ScanReport, SourceEnvironment, FolderScanResult, FolderOrigin
 from .core.package import build_migration_plan, create_package, load_manifest
-from .core.report import run_source_scan, write_html_report, write_json_report
+from .core.report import (
+    run_source_scan,
+    write_html_report,
+    write_json_report,
+    write_restore_report_html,
+)
+from .core.restore import (
+    VALID_CONFLICT_POLICIES,
+    build_restore_preview,
+    restore_status,
+    run_restore,
+    verify_restore,
+)
 from .core.verify import verify_package
 
 
@@ -101,6 +113,48 @@ def main(argv: list[str] | None = None) -> int:
     verify_p = sub.add_parser("verify", help="Verify package contents against recorded state")
     verify_p.add_argument("--package-dir", required=True)
     verify_p.add_argument(
+        "--level", choices=["fast", "balanced", "full"], default="balanced"
+    )
+
+    restore_preview_p = sub.add_parser(
+        "restore-preview", help="Show where a package would restore to on this machine"
+    )
+    restore_preview_p.add_argument("--package-dir", required=True)
+    restore_preview_p.add_argument(
+        "--custom-override",
+        action="append",
+        default=[],
+        metavar="LOGICAL_FOLDER=PATH",
+        help="Destination override for a CUSTOM item (repeatable)",
+    )
+
+    restore_p = sub.add_parser("restore", help="Restore a package's files to this machine")
+    restore_p.add_argument("--package-dir", required=True)
+    restore_p.add_argument(
+        "--conflict-policy", choices=list(VALID_CONFLICT_POLICIES), default="replace_if_newer"
+    )
+    restore_p.add_argument(
+        "--custom-override",
+        action="append",
+        default=[],
+        metavar="LOGICAL_FOLDER=PATH",
+        help="Destination override for a CUSTOM item (repeatable)",
+    )
+    restore_p.add_argument(
+        "--no-hash-check", action="store_true", help="Skip post-copy hash verification (faster)"
+    )
+    restore_p.add_argument(
+        "--report", default=None, help="Optional path to write an HTML restore report"
+    )
+
+    restore_status_p = sub.add_parser("restore-status", help="Show restore progress for a package")
+    restore_status_p.add_argument("--package-dir", required=True)
+
+    restore_verify_p = sub.add_parser(
+        "restore-verify", help="Verify restored files against their destination"
+    )
+    restore_verify_p.add_argument("--package-dir", required=True)
+    restore_verify_p.add_argument(
         "--level", choices=["fast", "balanced", "full"], default="balanced"
     )
 
@@ -194,6 +248,104 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "verify":
         print(f"Verifying {args.package_dir} (level: {args.level})...", file=sys.stderr)
         summary = verify_package(args.package_dir, level=args.level)
+        print()
+        print(f"Checked  : {summary.checked}")
+        print(f"Verified : {summary.verified}")
+        print(f"Failed   : {summary.failed}")
+        print(f"Missing  : {summary.missing}")
+        if summary.problems:
+            print()
+            print("Problems:")
+            for p in summary.problems[:20]:
+                print(f"  {p['path']}: {p['problem']}")
+        return 0 if summary.failed == 0 and summary.missing == 0 else 2
+
+    if args.command in ("restore-preview", "restore"):
+        overrides = {}
+        for entry in args.custom_override:
+            if "=" not in entry:
+                print(f"Ignoring malformed --custom-override {entry!r} (expected LOGICAL_FOLDER=PATH)", file=sys.stderr)
+                continue
+            key, _, val = entry.partition("=")
+            overrides[key] = val
+
+    if args.command == "restore-preview":
+        manifest = load_manifest(args.package_dir)
+        preview = build_restore_preview(args.package_dir, manifest, custom_overrides=overrides)
+
+        print(f"Package from {preview.package_source_computer}, created {preview.package_created_utc}")
+        print()
+        for item in preview.items:
+            status = "OK" if item.destination_resolved else "UNRESOLVED"
+            print(
+                f"  [{status:<10}] {item.logical_folder:<20} -> {item.destination_root or '(none)'}"
+            )
+            print(
+                f"               {item.file_count:>7,} files, {_human_size(item.total_bytes):>10}, "
+                f"{item.existing_conflicts} existing conflict(s)"
+            )
+            if item.destination_warning:
+                print(f"               ! {item.destination_warning}")
+        print()
+        print(f"Total to restore : {_human_size(preview.required_bytes)}")
+        for root, free in preview.free_bytes_by_root.items():
+            free_str = _human_size(free) if free is not None else "unknown"
+            print(f"Free space at {root}: {free_str}")
+        if preview.unresolved_items:
+            print()
+            print(f"UNRESOLVED (won't be restored until resolved): {', '.join(preview.unresolved_items)}")
+        return 0
+
+    if args.command == "restore":
+        manifest = load_manifest(args.package_dir)
+        preview = build_restore_preview(args.package_dir, manifest, custom_overrides=overrides)
+
+        print(
+            f"Restoring from {args.package_dir} (conflict policy: {args.conflict_policy})...",
+            file=sys.stderr,
+        )
+        summary = run_restore(
+            args.package_dir,
+            manifest,
+            conflict_policy=args.conflict_policy,
+            custom_overrides=overrides,
+            hash_check=not args.no_hash_check,
+        )
+
+        print()
+        print(f"Newly seeded      : {summary.seeded}")
+        print(f"Restored          : {summary.restored}  ({_human_size(summary.total_bytes_restored)})")
+        print(f"Already done      : {summary.already_done}")
+        print(f"Skipped by policy : {summary.skipped_policy}")
+        print(f"Conflicts renamed : {summary.conflicts_renamed}")
+        print(f"Failed            : {summary.failed}")
+        if summary.blocked_items:
+            print(f"Blocked items     : {', '.join(summary.blocked_items)} (destination unresolved)")
+        if summary.errors:
+            print()
+            print("Errors:")
+            for e in summary.errors[:20]:
+                print(f"  {e['package_rel_path']}: {e['error']}")
+            if len(summary.errors) > 20:
+                print(f"  ...and {len(summary.errors) - 20} more (see metadata/restore_errors.jsonl)")
+
+        if args.report:
+            write_restore_report_html(preview, summary, args.report)
+            print()
+            print(f"Report written to: {args.report}")
+
+        return 0 if summary.failed == 0 else 2
+
+    if args.command == "restore-status":
+        status = restore_status(args.package_dir)
+        print(f"Restore status for {args.package_dir}:")
+        for state, count in status.items():
+            print(f"  {state:<10} {count:>7,} files")
+        return 0
+
+    if args.command == "restore-verify":
+        print(f"Verifying restored files (level: {args.level})...", file=sys.stderr)
+        summary = verify_restore(args.package_dir, level=args.level)
         print()
         print(f"Checked  : {summary.checked}")
         print(f"Verified : {summary.verified}")

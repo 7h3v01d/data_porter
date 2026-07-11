@@ -203,3 +203,99 @@ def write_html_report(report: ScanReport, output_path: str) -> None:
 """
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(doc)
+
+
+def write_restore_report_html(
+    preview,
+    summary,
+    output_path: str,
+) -> None:
+    """
+    Renders the restore preview (what was resolved/planned) alongside the
+    final restore summary (what actually happened) as one human-readable
+    report -- the spec's "prove what succeeded, failed, or was skipped"
+    requirement (section 7).
+
+    ``preview`` is a restore.RestorePreview, ``summary`` a
+    restore.RestoreSummary. Kept loosely typed (no import of restore.py
+    here) to avoid a circular import between report.py and restore.py.
+    """
+    item_rows = []
+    for item in preview.items:
+        status = "resolved" if item.destination_resolved else "UNRESOLVED"
+        warn = (
+            f"<br><span class='warn'>{html.escape(item.destination_warning)}</span>"
+            if item.destination_warning
+            else ""
+        )
+        item_rows.append(
+            "<tr>"
+            f"<td>{html.escape(item.logical_folder)}</td>"
+            f"<td>{html.escape(item.destination_root or '-')}{warn}</td>"
+            f"<td>{status}</td>"
+            f"<td>{item.file_count:,}</td>"
+            f"<td>{_human_size(item.total_bytes)}</td>"
+            f"<td>{item.existing_conflicts}</td>"
+            "</tr>"
+        )
+
+    problem_rows = []
+    for e in summary.errors[:200]:
+        problem_rows.append(
+            f"<tr><td>{html.escape(e.get('package_rel_path', ''))}</td>"
+            f"<td>{html.escape(e.get('error', ''))}</td></tr>"
+        )
+
+    failures_section = ""
+    if problem_rows:
+        failures_section = (
+            "<h2>Failures</h2><table><tr><th>File</th><th>Error</th></tr>"
+            + "".join(problem_rows)
+            + "</table>"
+        )
+
+    doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Data Porter -- Restore Report</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; margin: 2rem; color: #1a1a1a; background: #fafafa; }}
+  h1 {{ margin-bottom: 0.2rem; }}
+  .meta {{ color: #555; margin-bottom: 1.5rem; }}
+  table {{ border-collapse: collapse; width: 100%; margin-bottom: 2rem; background: white; }}
+  th, td {{ border: 1px solid #ddd; padding: 0.5rem 0.75rem; text-align: left; font-size: 0.92rem; }}
+  th {{ background: #f0f0f0; }}
+  .warn {{ color: #a33; font-size: 0.85em; }}
+  .totals {{ font-size: 1.1rem; margin-bottom: 1.5rem; }}
+  .totals b {{ font-size: 1.3rem; }}
+</style>
+</head>
+<body>
+  <h1>Data Porter &mdash; Restore Report</h1>
+  <div class="meta">
+    Package from {html.escape(preview.package_source_computer)} &middot;
+    created {html.escape(preview.package_created_utc)} &middot;
+    migration_id {html.escape(preview.package_migration_id)}
+  </div>
+
+  <div class="totals">
+    Restored: <b>{summary.restored:,}</b> ({_human_size(summary.total_bytes_restored)}) &nbsp;|&nbsp;
+    Already done: <b>{summary.already_done:,}</b> &nbsp;|&nbsp;
+    Skipped by policy: <b>{summary.skipped_policy:,}</b> &nbsp;|&nbsp;
+    Conflicts renamed: <b>{summary.conflicts_renamed:,}</b> &nbsp;|&nbsp;
+    Failed: <b>{summary.failed:,}</b>
+  </div>
+
+  <h2>Items</h2>
+  <table>
+    <tr><th>Folder</th><th>Destination</th><th>Status</th><th>Files</th><th>Size</th><th>Existing conflicts</th></tr>
+    {''.join(item_rows)}
+  </table>
+
+  {failures_section}
+</body>
+</html>
+"""
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(doc)

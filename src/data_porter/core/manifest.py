@@ -60,6 +60,17 @@ def restore_target_for(logical_name: str, origin: FolderOrigin) -> str:
     return CUSTOM_RESTORE_TARGET
 
 
+_RESTORE_TARGET_TO_KNOWN_FOLDER = {v: k for k, v in _KNOWN_FOLDER_RESTORE_TARGETS.items()}
+
+
+def known_folder_name_for_restore_target(restore_target: str) -> Optional[str]:
+    """Reverse of restore_target_for: given a manifest item's stored
+    restore_target (e.g. "KNOWN_FOLDER_DOCUMENTS"), return the logical
+    Known Folder name ("Documents") that known_folders.py understands, or
+    None for "CUSTOM" / anything unrecognised."""
+    return _RESTORE_TARGET_TO_KNOWN_FOLDER.get(restore_target)
+
+
 _SANITIZE_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
