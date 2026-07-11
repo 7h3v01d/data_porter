@@ -1,0 +1,20 @@
+[project]
+name = "data-porter"
+version = "0.1.0"
+description = "Manifest-driven personal data migration tool (core scan engine, v0.1)"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+windows = ["pywin32"]
+gui = ["PyQt6"]
+
+[project.scripts]
+data-porter = "data_porter.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
