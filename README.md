@@ -30,8 +30,7 @@ scan  →  plan  →  capture  →  verify  →  restore  →  restore-verify
      non-Windows platforms — this is what let me build and test the whole
      thing in this sandbox without a Windows box on hand. It's clearly
      tagged in the result (`method="dev_fallback"`) so it can never be
-     mistaken for a real Windows resolution once you run it on your dad's
-     PC.
+     mistaken for a real Windows resolution once you run it on your PC.
 
 - **`core/scanner.py`** — the actual walk. Per the spec's edge-case list,
   it already handles:
@@ -159,7 +158,7 @@ scan  →  plan  →  capture  →  verify  →  restore  →  restore-verify
 
 ## Running it
 
-On your dad's Windows machine (once you copy this over):
+On Windows machine (once you copy this over):
 
 ```bash
 pip install pywin32          # optional, primary resolution path
@@ -238,6 +237,6 @@ restore-verify) working end to end, the natural next steps are either:
    `is_cloud_placeholder`, so the groundwork is there, but there's no
    explicit hydrate/exclude policy wired through capture yet.
 
-Given Dad's move is Win11→Win11 with likely OneDrive-redirected folders,
+Given the move is Win11→Win11 with likely OneDrive-redirected folders,
 I'd lean toward OneDrive-awareness before the GUI — it's the part of the
 spec most likely to bite on his actual machine.
